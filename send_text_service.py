@@ -174,12 +174,32 @@ async def write_line(writer, line):
 
 async def try_write_line(writer, line):
     if writer.is_closing():
-        return
+        return False
 
     try:
         await write_line(writer, line)
-    except (ConnectionError, RuntimeError):
+        return True
+    except (ConnectionError, OSError, RuntimeError):
+        return False
+
+
+async def close_writer(writer):
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except (ConnectionError, OSError, RuntimeError):
         pass
+
+
+async def read_text_line(reader):
+    try:
+        return await reader.readuntil(b"\n")
+    except asyncio.IncompleteReadError as exc:
+        if exc.partial:
+            return exc.partial
+        return None
+    except (ConnectionError, OSError, RuntimeError):
+        return None
 
 
 async def handle_client(reader, writer, queue, counter, max_line_bytes):
@@ -187,24 +207,25 @@ async def handle_client(reader, writer, queue, counter, max_line_bytes):
     client_name = f"{peer[0]}:{peer[1]}" if peer else "unknown"
     print(f"client connected: {client_name}")
 
-    await write_line(writer, "READY send one UTF-8 text message per line")
+    if not await try_write_line(writer, "READY send one UTF-8 text message per line"):
+        print(f"client disconnected before READY: {client_name}")
+        await close_writer(writer)
+        return
 
     try:
         while True:
             try:
-                raw_line = await reader.readuntil(b"\n")
-            except asyncio.IncompleteReadError as exc:
-                if exc.partial:
-                    raw_line = exc.partial
-                else:
-                    break
+                raw_line = await read_text_line(reader)
             except asyncio.LimitOverrunError:
-                await write_line(writer, f"ERR line too long, max {max_line_bytes} bytes")
+                await try_write_line(writer, f"ERR line too long, max {max_line_bytes} bytes")
                 await reader.read(max_line_bytes)
                 continue
 
+            if raw_line is None:
+                break
+
             if len(raw_line) > max_line_bytes:
-                await write_line(writer, f"ERR line too long, max {max_line_bytes} bytes")
+                await try_write_line(writer, f"ERR line too long, max {max_line_bytes} bytes")
                 continue
 
             text = raw_line.decode("utf-8", errors="replace").strip()
@@ -220,11 +241,10 @@ async def handle_client(reader, writer, queue, counter, max_line_bytes):
                 client_writer=writer,
             )
             await queue.put(message)
-            await write_line(writer, f"QUEUED {sequence}")
+            await try_write_line(writer, f"QUEUED {sequence}")
             print(f"queued #{sequence} from {client_name}: {text}")
     finally:
-        writer.close()
-        await writer.wait_closed()
+        await close_writer(writer)
         print(f"client disconnected: {client_name}")
 
 
