@@ -62,6 +62,7 @@ const uint8_t AUDIO_FORMAT_PCM16_LE = 1;
 const uint32_t MIN_SAMPLE_RATE = 8000;
 const uint32_t MAX_SAMPLE_RATE = 48000;
 const uint32_t CLIENT_IDLE_TIMEOUT_MS = 5000;
+const uint32_t PREBUFFER_MS = 1000;
 
 struct AudioHeader {
   uint32_t magic;
@@ -205,11 +206,81 @@ bool writeStereoSamples(const uint8_t* input, size_t inputBytes, uint8_t channel
   return true;
 }
 
+size_t audioFrameBytes(const AudioHeader& header) {
+  return static_cast<size_t>(header.channels) * sizeof(int16_t);
+}
+
+uint32_t prebufferBytesFor(const AudioHeader& header) {
+  uint32_t bytes = header.sampleRate * header.channels * sizeof(int16_t) * PREBUFFER_MS / 1000;
+  uint32_t frameBytes = static_cast<uint32_t>(audioFrameBytes(header));
+
+  bytes -= bytes % frameBytes;
+  if (header.payloadBytes > 0 && bytes > header.payloadBytes) {
+    bytes = header.payloadBytes - (header.payloadBytes % frameBytes);
+  }
+
+  return bytes;
+}
+
+bool readAudioBytes(WiFiClient& client, uint8_t* buffer, size_t length, uint32_t& lastByteAt) {
+  size_t received = 0;
+
+  while (received < length && client.connected()) {
+    int available = client.available();
+
+    if (available > 0) {
+      size_t wanted = min(static_cast<size_t>(available), length - received);
+      int bytesRead = client.read(buffer + received, wanted);
+      if (bytesRead > 0) {
+        received += static_cast<size_t>(bytesRead);
+        lastByteAt = millis();
+        continue;
+      }
+    }
+
+    if (millis() - lastByteAt > CLIENT_IDLE_TIMEOUT_MS) {
+      Serial.println("Client audio stream timed out");
+      return false;
+    }
+    delay(1);
+  }
+
+  return received == length;
+}
+
 bool playAudioStream(WiFiClient& client, const AudioHeader& header) {
   uint8_t buffer[2048];
   uint32_t remaining = header.payloadBytes;
   uint32_t lastByteAt = millis();
   uint32_t playedBytes = 0;
+  uint32_t prebufferBytes = prebufferBytesFor(header);
+
+  if (prebufferBytes > 0) {
+    uint8_t* prebuffer = static_cast<uint8_t*>(malloc(prebufferBytes));
+    if (prebuffer == nullptr) {
+      Serial.println("Audio prebuffer allocation failed");
+      return false;
+    }
+
+    Serial.print("Prebuffering PCM bytes: ");
+    Serial.println(prebufferBytes);
+
+    bool ok = readAudioBytes(client, prebuffer, prebufferBytes, lastByteAt);
+    if (ok) {
+      ok = writeStereoSamples(prebuffer, prebufferBytes, header.channels);
+    }
+    free(prebuffer);
+
+    if (!ok) {
+      Serial.println("Prebuffer playback failed");
+      return false;
+    }
+
+    playedBytes += prebufferBytes;
+    if (header.payloadBytes > 0) {
+      remaining -= prebufferBytes;
+    }
+  }
 
   while (client.connected()) {
     size_t wanted = sizeof(buffer);

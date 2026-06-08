@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ps ax |#!/usr/bin/env python3
 """TCP text-to-speech queue service for the ESP32 AUD1 audio receiver.
 
 Clients connect to this service and send one UTF-8 text message per line. The
