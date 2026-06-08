@@ -39,6 +39,7 @@
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
+#include "esp_heap_caps.h"
 #include "driver/i2s.h"
 
 // ---------- Wi-Fi ----------
@@ -62,7 +63,7 @@ const uint8_t AUDIO_FORMAT_PCM16_LE = 1;
 const uint32_t MIN_SAMPLE_RATE = 8000;
 const uint32_t MAX_SAMPLE_RATE = 48000;
 const uint32_t CLIENT_IDLE_TIMEOUT_MS = 5000;
-const uint32_t PREBUFFER_MS = 1000;
+const size_t READ_BUFFER_BYTES = 2048;
 
 struct AudioHeader {
   uint32_t magic;
@@ -206,20 +207,8 @@ bool writeStereoSamples(const uint8_t* input, size_t inputBytes, uint8_t channel
   return true;
 }
 
-size_t audioFrameBytes(const AudioHeader& header) {
+size_t inputFrameBytes(const AudioHeader& header) {
   return static_cast<size_t>(header.channels) * sizeof(int16_t);
-}
-
-uint32_t prebufferBytesFor(const AudioHeader& header) {
-  uint32_t bytes = header.sampleRate * header.channels * sizeof(int16_t) * PREBUFFER_MS / 1000;
-  uint32_t frameBytes = static_cast<uint32_t>(audioFrameBytes(header));
-
-  bytes -= bytes % frameBytes;
-  if (header.payloadBytes > 0 && bytes > header.payloadBytes) {
-    bytes = header.payloadBytes - (header.payloadBytes % frameBytes);
-  }
-
-  return bytes;
 }
 
 bool readAudioBytes(WiFiClient& client, uint8_t* buffer, size_t length, uint32_t& lastByteAt) {
@@ -248,50 +237,62 @@ bool readAudioBytes(WiFiClient& client, uint8_t* buffer, size_t length, uint32_t
   return received == length;
 }
 
-bool playAudioStream(WiFiClient& client, const AudioHeader& header) {
-  uint8_t buffer[2048];
-  uint32_t remaining = header.payloadBytes;
-  uint32_t lastByteAt = millis();
-  uint32_t playedBytes = 0;
-  uint32_t prebufferBytes = prebufferBytesFor(header);
-
-  if (prebufferBytes > 0) {
-    uint8_t* prebuffer = static_cast<uint8_t*>(malloc(prebufferBytes));
-    if (prebuffer == nullptr) {
-      Serial.println("Audio prebuffer allocation failed");
-      return false;
-    }
-
-    Serial.print("Prebuffering PCM bytes: ");
-    Serial.println(prebufferBytes);
-
-    bool ok = readAudioBytes(client, prebuffer, prebufferBytes, lastByteAt);
-    if (ok) {
-      ok = writeStereoSamples(prebuffer, prebufferBytes, header.channels);
-    }
-    free(prebuffer);
-
-    if (!ok) {
-      Serial.println("Prebuffer playback failed");
-      return false;
-    }
-
-    playedBytes += prebufferBytes;
-    if (header.payloadBytes > 0) {
-      remaining -= prebufferBytes;
-    }
+uint8_t* allocateAudioBuffer(size_t audioBytes) {
+  if (!psramFound()) {
+    Serial.println("PSRAM not found; cannot buffer audio message");
+    return nullptr;
   }
 
+  size_t freePsram = ESP.getFreePsram();
+  size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+  Serial.print("PSRAM free bytes: ");
+  Serial.println(freePsram);
+  Serial.print("PSRAM largest block bytes: ");
+  Serial.println(largestBlock);
+
+  uint8_t* audio = static_cast<uint8_t*>(
+    heap_caps_malloc(audioBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+  );
+
+  if (audio == nullptr) {
+    Serial.print("PSRAM audio buffer allocation failed, bytes=");
+    Serial.println(audioBytes);
+  }
+
+  return audio;
+}
+
+bool bufferKnownPayload(WiFiClient& client, const AudioHeader& header, uint8_t*& audio, size_t& audioBytes) {
+  audio = nullptr;
+  audioBytes = static_cast<size_t>(header.payloadBytes);
+
+  if (audioBytes == 0) {
+    return true;
+  }
+
+  audio = allocateAudioBuffer(audioBytes);
+  if (audio == nullptr) {
+    return false;
+  }
+
+  uint32_t lastByteAt = millis();
+  if (!readAudioBytes(client, audio, audioBytes, lastByteAt)) {
+    heap_caps_free(audio);
+    audio = nullptr;
+    audioBytes = 0;
+    return false;
+  }
+
+  return true;
+}
+
+bool playAudioStreamUntilClose(WiFiClient& client, const AudioHeader& header) {
+  uint8_t buffer[READ_BUFFER_BYTES];
+  uint32_t lastByteAt = millis();
+  size_t playedBytes = 0;
+
   while (client.connected()) {
-    size_t wanted = sizeof(buffer);
-
-    if (header.payloadBytes > 0) {
-      if (remaining == 0) {
-        break;
-      }
-      wanted = min(static_cast<uint32_t>(sizeof(buffer)), remaining);
-    }
-
     int available = client.available();
     if (available <= 0) {
       if (millis() - lastByteAt > CLIENT_IDLE_TIMEOUT_MS) {
@@ -302,13 +303,8 @@ bool playAudioStream(WiFiClient& client, const AudioHeader& header) {
       continue;
     }
 
-    size_t toRead = min(static_cast<size_t>(available), wanted);
-
-    if (header.channels == 1) {
-      toRead &= ~static_cast<size_t>(1);
-    } else {
-      toRead &= ~static_cast<size_t>(3);
-    }
+    size_t toRead = min(static_cast<size_t>(available), sizeof(buffer));
+    toRead -= toRead % inputFrameBytes(header);
 
     if (toRead == 0) {
       delay(1);
@@ -322,16 +318,40 @@ bool playAudioStream(WiFiClient& client, const AudioHeader& header) {
     }
 
     lastByteAt = millis();
-
     if (!writeStereoSamples(buffer, static_cast<size_t>(bytesRead), header.channels)) {
       Serial.println("I2S write failed");
       return false;
     }
 
-    playedBytes += static_cast<uint32_t>(bytesRead);
-    if (header.payloadBytes > 0) {
-      remaining -= static_cast<uint32_t>(bytesRead);
+    playedBytes += static_cast<size_t>(bytesRead);
+  }
+
+  i2s_zero_dma_buffer(I2S_PORT);
+  Serial.print("Streamed PCM bytes: ");
+  Serial.println(playedBytes);
+
+  return true;
+}
+
+bool playBufferedAudio(const AudioHeader& header, const uint8_t* audio, size_t audioBytes) {
+  const size_t frameBytes = inputFrameBytes(header);
+  size_t playableBytes = audioBytes - (audioBytes % frameBytes);
+
+  if (playableBytes != audioBytes) {
+    Serial.print("Dropping partial PCM frame bytes: ");
+    Serial.println(audioBytes - playableBytes);
+  }
+
+  size_t playedBytes = 0;
+  while (playedBytes < playableBytes) {
+    size_t chunkBytes = min(READ_BUFFER_BYTES, playableBytes - playedBytes);
+
+    if (!writeStereoSamples(audio + playedBytes, chunkBytes, header.channels)) {
+      Serial.println("I2S write failed");
+      return false;
     }
+
+    playedBytes += chunkBytes;
   }
 
   i2s_zero_dma_buffer(I2S_PORT);
@@ -339,7 +359,7 @@ bool playAudioStream(WiFiClient& client, const AudioHeader& header) {
   Serial.print("Played PCM bytes: ");
   Serial.println(playedBytes);
 
-  return header.payloadBytes == 0 || remaining == 0;
+  return true;
 }
 
 void handleClient(WiFiClient client) {
@@ -375,7 +395,24 @@ void handleClient(WiFiClient client) {
   setupI2S(header.sampleRate);
   client.println("OK AUD1");
 
-  bool ok = playAudioStream(client, header);
+  bool ok = true;
+  if (header.payloadBytes > 0) {
+    uint8_t* audio = nullptr;
+    size_t audioBytes = 0;
+
+    Serial.println("Buffering complete audio message before playback");
+    ok = bufferKnownPayload(client, header, audio, audioBytes);
+    if (ok) {
+      Serial.print("Buffered PCM bytes: ");
+      Serial.println(audioBytes);
+      ok = playBufferedAudio(header, audio, audioBytes);
+    }
+    heap_caps_free(audio);
+  } else {
+    Serial.println("Streaming audio until TCP close");
+    ok = playAudioStreamUntilClose(client, header);
+  }
+
   client.println(ok ? "DONE" : "ERR playback failed");
   client.stop();
   Serial.println("TCP client disconnected");
@@ -414,6 +451,13 @@ void setupWiFi() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+
+  Serial.print("PSRAM found: ");
+  Serial.println(psramFound() ? "yes" : "no");
+  Serial.print("PSRAM total bytes: ");
+  Serial.println(ESP.getPsramSize());
+  Serial.print("PSRAM free bytes: ");
+  Serial.println(ESP.getFreePsram());
 
   setupI2S(24000);
   setupWiFi();
