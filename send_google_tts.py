@@ -11,7 +11,7 @@ import sys
 import urllib.parse
 import urllib.request
 
-from send_tone import DEFAULT_PORT, DEFAULT_SAMPLE_RATE, send_pcm
+from aud1_protocol import DEFAULT_PORT, DEFAULT_SAMPLE_RATE, send_pcm
 
 
 GOOGLE_TTS_URL = "https://translate.google.com/translate_tts"

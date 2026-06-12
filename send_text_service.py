@@ -1,4 +1,4 @@
-ps ax |#!/usr/bin/env python3
+#!/usr/bin/env python3
 """TCP text-to-speech queue service for the ESP32 AUD1 audio receiver.
 
 Clients connect to this service and send one UTF-8 text message per line. The
@@ -23,8 +23,8 @@ from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from aud1_protocol import DEFAULT_PORT, DEFAULT_SAMPLE_RATE, send_pcm
 from send_google_tts import fetch_google_tts_mp3, mp3_to_pcm16 as ffmpeg_mp3_to_pcm16
-from send_tone import DEFAULT_PORT, DEFAULT_SAMPLE_RATE, send_pcm
 
 
 DEFAULT_LISTEN_HOST = "0.0.0.0"

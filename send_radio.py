@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from send_tone import DEFAULT_PORT, DEFAULT_SAMPLE_RATE, make_header, read_reply
+from aud1_protocol import DEFAULT_PORT, DEFAULT_SAMPLE_RATE, make_header, read_reply
 
 
 DEFAULT_HOST = "audio-alert.local"

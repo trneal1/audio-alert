@@ -405,6 +405,8 @@ void handleClient(WiFiClient client) {
     if (ok) {
       Serial.print("Buffered PCM bytes: ");
       Serial.println(audioBytes);
+      client.print("RECEIVED ");
+      client.println(audioBytes);
       ok = playBufferedAudio(header, audio, audioBytes);
     }
     heap_caps_free(audio);
