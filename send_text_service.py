@@ -272,12 +272,17 @@ async def playback_worker(queue, args):
                 args.volume,
                 args.decoder,
             )
+
+            def report_send_start(part, byte_count):
+                print(f"sending {part} #{message.sequence}: {byte_count} bytes")
+
             await asyncio.to_thread(
                 send_pcm,
                 args.device_host,
                 args.device_port,
                 args.sample_rate,
                 pcm_bytes,
+                report_send_start,
             )
             print(f"done #{message.sequence}")
         except Exception as exc:
