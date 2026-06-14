@@ -17,16 +17,19 @@ import itertools
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from aud1_protocol import DEFAULT_PORT, DEFAULT_SAMPLE_RATE, send_pcm
-from send_google_tts import fetch_google_tts_mp3, mp3_to_pcm16 as ffmpeg_mp3_to_pcm16
 
 
+GOOGLE_TTS_URL = "https://translate.google.com/translate_tts"
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 7788
 DEFAULT_LANGUAGE = "en"
@@ -45,6 +48,78 @@ class QueuedMessage:
     text: str = field(compare=False)
     client_name: str = field(compare=False)
     client_writer: asyncio.StreamWriter = field(compare=False)
+
+
+def fetch_google_tts_mp3(text, language):
+    params = urllib.parse.urlencode(
+        {
+            "ie": "UTF-8",
+            "client": "tw-ob",
+            "tl": language,
+            "q": text,
+        }
+    )
+    request = urllib.request.Request(
+        f"{GOOGLE_TTS_URL}?{params}",
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0 Safari/537.36"
+            )
+        },
+    )
+
+    with urllib.request.urlopen(request, timeout=20) as response:
+        content_type = response.headers.get("Content-Type", "")
+        mp3_bytes = response.read()
+
+    if not mp3_bytes:
+        raise RuntimeError("Google TTS returned no audio")
+    if "audio" not in content_type and not mp3_bytes.startswith(b"ID3"):
+        raise RuntimeError(f"Google TTS did not return audio, content type was {content_type!r}")
+
+    return mp3_bytes
+
+
+def ffmpeg_mp3_to_pcm16(mp3_bytes, sample_rate, volume):
+    volume_filter = f"volume={volume}" if volume != 1.0 else "anull"
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-af",
+        volume_filter,
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            input=mp3_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg is required and was not found on PATH") from exc
+
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg failed: {error}")
+    if not result.stdout:
+        raise RuntimeError("ffmpeg returned no PCM audio")
+
+    return result.stdout
 
 
 def apply_pcm16_volume(pcm_bytes, volume):
