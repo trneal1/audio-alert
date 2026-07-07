@@ -39,6 +39,14 @@ DEFAULT_MAX_LINE_BYTES = 4096
 DEFAULT_DECODER = "ffmpeg"
 DEFAULT_TTS_CACHE_DIR = ".tts_cache"
 MAX_TTS_CACHE_LABEL_CHARS = 80
+PLAY_WINDOW_PATTERN = re.compile(r"^(\d{2})(\d{2})-(\d{2})(\d{2})$")
+
+
+@dataclass(frozen=True)
+class PlayWindow:
+    start_minute: int
+    end_minute: int
+    label: str
 
 
 @dataclass(order=True)
@@ -48,6 +56,37 @@ class QueuedMessage:
     text: str = field(compare=False)
     client_name: str = field(compare=False)
     client_writer: asyncio.StreamWriter = field(compare=False)
+
+
+def parse_play_window(value):
+    match = PLAY_WINDOW_PATTERN.fullmatch(value)
+    if not match:
+        raise argparse.ArgumentTypeError("play window must use HHMM-HHMM, for example 0555-2205")
+
+    start_hour, start_minute, end_hour, end_minute = (int(part) for part in match.groups())
+    if start_hour > 23 or end_hour > 23:
+        raise argparse.ArgumentTypeError("play window hours must be from 00 to 23")
+    if start_minute > 59 or end_minute > 59:
+        raise argparse.ArgumentTypeError("play window minutes must be from 00 to 59")
+
+    return PlayWindow(
+        start_minute=start_hour * 60 + start_minute,
+        end_minute=end_hour * 60 + end_minute,
+        label=value,
+    )
+
+
+def is_within_play_window(play_window, when=None):
+    if play_window is None:
+        return True
+
+    local_time = time.localtime(when)
+    current_minute = local_time.tm_hour * 60 + local_time.tm_min
+    if play_window.start_minute == play_window.end_minute:
+        return True
+    if play_window.start_minute < play_window.end_minute:
+        return play_window.start_minute <= current_minute <= play_window.end_minute
+    return current_minute >= play_window.start_minute or current_minute <= play_window.end_minute
 
 
 def fetch_google_tts_mp3(text, language):
@@ -328,6 +367,17 @@ async def playback_worker(queue, args):
         message = await queue.get()
 
         try:
+            if not is_within_play_window(args.play_window):
+                print(
+                    f"skipping #{message.sequence} outside play window "
+                    f"{args.play_window.label}: {message.text}"
+                )
+                await try_write_line(
+                    message.client_writer,
+                    f"SKIPPED {message.sequence} OUTSIDE_PLAY_WINDOW {args.play_window.label}",
+                )
+                continue
+
             print(f"playing #{message.sequence} from {message.client_name}: {message.text}")
             mp3_bytes, cache_hit = await asyncio.to_thread(
                 fetch_cached_tts_mp3,
@@ -432,6 +482,16 @@ def build_arg_parser():
         help="Seconds to wait between queued plays",
     )
     parser.add_argument(
+        "--play-window",
+        type=parse_play_window,
+        default=None,
+        metavar="HHMM-HHMM",
+        help=(
+            "Local-time window when queued audio may play, for example 0555-2205; "
+            "omit to allow playback at any time"
+        ),
+    )
+    parser.add_argument(
         "--max-line-bytes",
         type=int,
         default=DEFAULT_MAX_LINE_BYTES,
@@ -456,6 +516,8 @@ async def run_server(args):
     print(f"text service listening on {sockets}")
     print(f"playing to {args.device_host}:{args.device_port}")
     print(f"decoder: {args.decoder}")
+    if args.play_window:
+        print(f"play window: {args.play_window.label}")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
