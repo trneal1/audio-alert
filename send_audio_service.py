@@ -6,6 +6,7 @@ Clients connect to this service and send one UTF-8 command per line.
 Examples:
   TEXT The laundry is done
   TONE 440:0.2 440-880:0.6 880:0.2 volume=0.35 wobbles=5
+  REPEAT 3 TONE 440:0.2; TEXT beep; TONE 880:0.2
 
 Bare lines without a command prefix are treated as text.
 """
@@ -41,6 +42,7 @@ from send_tone_service import (
 
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 7790
+MAX_REPEAT_COUNT = 100
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,53 @@ def parse_audio_request(line, default_sample_rate):
         )
 
     return AudioRequest(kind="text", text=line)
+
+
+def parse_repeat_count(value):
+    try:
+        repeat_count = int(value, 10)
+    except ValueError as exc:
+        raise ValueError("REPEAT count must be an integer") from exc
+
+    if repeat_count < 1:
+        raise ValueError("REPEAT count must be 1 or greater")
+    if repeat_count > MAX_REPEAT_COUNT:
+        raise ValueError(f"REPEAT count must be {MAX_REPEAT_COUNT} or less")
+
+    return repeat_count
+
+
+def parse_repeated_audio_requests(line, default_sample_rate):
+    _, _, payload = line.partition(" ")
+    count_text, _, sequence_text = payload.strip().partition(" ")
+    if not count_text or not sequence_text.strip():
+        raise ValueError("REPEAT requires: REPEAT count COMMAND ... ; COMMAND ...")
+
+    repeat_count = parse_repeat_count(count_text)
+    sequence_text = sequence_text.strip()
+    if sequence_text.startswith("[") and sequence_text.endswith("]"):
+        sequence_text = sequence_text[1:-1].strip()
+
+    items = [item.strip() for item in sequence_text.split(";") if item.strip()]
+    if not items:
+        raise ValueError("REPEAT requires at least one nested TEXT or TONE command")
+
+    sequence = []
+    for item in items:
+        request = parse_audio_request(item, default_sample_rate)
+        if request.kind not in ("text", "tone"):
+            raise ValueError("REPEAT items must be TEXT or TONE commands")
+        sequence.append(request)
+
+    return sequence * repeat_count, repeat_count, len(sequence)
+
+
+def parse_audio_requests(line, default_sample_rate):
+    command = line.split(None, 1)[0].upper() if line.split(None, 1) else ""
+    if command == "REPEAT":
+        return parse_repeated_audio_requests(line, default_sample_rate)
+
+    return [parse_audio_request(line, default_sample_rate)], 1, 1
 
 
 async def write_line(writer, line):
@@ -123,6 +172,7 @@ async def handle_client(reader, writer, queue, counter, args):
 
     ready = (
         "READY send TEXT message, TONE 440:0.2 440-880:0.6 volume=0.35 wobbles=5, "
+        "REPEAT 3 TONE 440:0.2; TEXT beep; TONE 880:0.2, "
         "or bare text"
     )
     if not await try_write_line(writer, ready):
@@ -149,23 +199,39 @@ async def handle_client(reader, writer, queue, counter, args):
                 continue
 
             try:
-                request = parse_audio_request(line, args.sample_rate)
+                requests, repeat_count, sequence_length = parse_audio_requests(line, args.sample_rate)
             except ValueError as exc:
                 await try_write_line(writer, f"ERR {exc}")
                 continue
 
-            sequence = next(counter)
-            await queue.put(
-                QueuedAudioRequest(
-                    sequence=sequence,
-                    received_at=time.time(),
-                    request=request,
-                    client_name=client_name,
-                    client_writer=writer,
+            first_sequence = None
+            last_sequence = None
+            for request in requests:
+                sequence = next(counter)
+                first_sequence = sequence if first_sequence is None else first_sequence
+                last_sequence = sequence
+                await queue.put(
+                    QueuedAudioRequest(
+                        sequence=sequence,
+                        received_at=time.time(),
+                        request=request,
+                        client_name=client_name,
+                        client_writer=writer,
+                    )
                 )
-            )
-            await try_write_line(writer, f"QUEUED {sequence} {request.kind.upper()}")
-            print(f"queued {request.kind} #{sequence} from {client_name}: {line}")
+
+            if len(requests) == 1:
+                await try_write_line(writer, f"QUEUED {first_sequence} {requests[0].kind.upper()}")
+                print(f"queued {requests[0].kind} #{first_sequence} from {client_name}: {line}")
+            else:
+                await try_write_line(
+                    writer,
+                    f"QUEUED {first_sequence}-{last_sequence} REPEAT {repeat_count}x {sequence_length} item(s)",
+                )
+                print(
+                    f"queued repeat #{first_sequence}-{last_sequence} from {client_name}: "
+                    f"{repeat_count}x {sequence_length} item(s)"
+                )
     finally:
         await close_writer(writer)
         print(f"audio client disconnected: {client_name}")
