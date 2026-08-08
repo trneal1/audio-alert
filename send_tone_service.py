@@ -11,23 +11,20 @@ Example client line:
 import argparse
 import asyncio
 import itertools
+import math
 import shlex
 import signal
 import sys
 import time
+from array import array
 from dataclasses import dataclass, field
 
 from aud1_protocol import DEFAULT_PORT, DEFAULT_SAMPLE_RATE, send_pcm
-from send_tone import (
-    DEFAULT_HOST as DEFAULT_DEVICE_HOST,
-    DEFAULT_VOLUME,
-    DEFAULT_WOBBLES,
-    build_tone_sequence_pcm,
-    expand_wobbles,
-    parse_tone,
-)
 
 
+DEFAULT_DEVICE_HOST = "audio-alert.local"
+DEFAULT_VOLUME = 0.35
+DEFAULT_WOBBLES = 1
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 7789
 DEFAULT_GAP = 0.0
@@ -52,6 +49,93 @@ class QueuedToneRequest:
     request: ToneRequest = field(compare=False)
     client_name: str = field(compare=False)
     client_writer: asyncio.StreamWriter = field(compare=False)
+
+
+def parse_frequency_range(value):
+    parts = value.split("-", 1)
+    try:
+        if len(parts) == 1:
+            frequency = float(parts[0])
+            start_frequency = frequency
+            end_frequency = frequency
+        else:
+            start_frequency = float(parts[0])
+            end_frequency = float(parts[1])
+    except ValueError as exc:
+        raise ValueError("frequency must be a number") from exc
+
+    if start_frequency <= 0 or end_frequency <= 0:
+        raise ValueError("frequency must be greater than 0")
+
+    return start_frequency, end_frequency
+
+
+def parse_tone(value):
+    separator = ":" if ":" in value else ","
+    parts = value.split(separator)
+
+    if len(parts) != 2:
+        raise ValueError(
+            "tone must be FREQ:DURATION or START-END:DURATION, for example 440:1.5 or 440-880:1.5"
+        )
+
+    try:
+        start_frequency, end_frequency = parse_frequency_range(parts[0])
+        duration = float(parts[1])
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+    if duration <= 0:
+        raise ValueError("duration must be greater than 0")
+
+    return start_frequency, end_frequency, duration
+
+
+def generate_tone_pcm(start_frequency, end_frequency, duration, sample_rate, volume):
+    sample_count = max(1, int(round(duration * sample_rate)))
+    amplitude = int(32767 * volume)
+    samples = array("h")
+    phase = 0.0
+
+    for index in range(sample_count):
+        value = math.sin(phase)
+        if sample_count == 1:
+            frequency = start_frequency
+        else:
+            fraction = index / (sample_count - 1)
+            frequency = start_frequency + ((end_frequency - start_frequency) * fraction)
+
+        phase += (2.0 * math.pi * frequency) / sample_rate
+        samples.append(int(amplitude * value))
+
+    if sys.byteorder != "little":
+        samples.byteswap()
+
+    return samples.tobytes()
+
+
+def build_tone_sequence_pcm(tones, sample_rate, volume, gap):
+    chunks = []
+    silence = b"\x00\x00" * int(round(gap * sample_rate))
+
+    for index, tone in enumerate(tones):
+        if index > 0 and silence:
+            chunks.append(silence)
+
+        if len(tone) == 2:
+            frequency, duration = tone
+            start_frequency = frequency
+            end_frequency = frequency
+        else:
+            start_frequency, end_frequency, duration = tone
+
+        chunks.append(generate_tone_pcm(start_frequency, end_frequency, duration, sample_rate, volume))
+
+    return b"".join(chunks)
+
+
+def expand_wobbles(tones, wobble_count):
+    return list(tones) * wobble_count
 
 
 def parse_int_setting(name, value):
@@ -88,7 +172,7 @@ def parse_tone_request(line, default_sample_rate):
 
             try:
                 tones.append(parse_tone(token))
-            except argparse.ArgumentTypeError as exc:
+            except ValueError as exc:
                 raise ValueError(str(exc)) from exc
             continue
 
